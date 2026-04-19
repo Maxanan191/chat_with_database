@@ -37,6 +37,12 @@ data_dict_text = """
 # =========================
 # HELPER FUNCTIONS
 # =========================
+def detect_language(text: str) -> str:
+    """Detect if text is Thai or English based on character presence."""
+    thai_chars = sum(1 for c in text if '\u0e00' <= c <= '\u0e7f')
+    return "thai" if thai_chars > 0 else "english"
+
+
 def query_to_dataframe(sql_query: str, database_name: str):
     """Run SQL query and return result as DataFrame."""
     connection = None
@@ -57,7 +63,6 @@ def generate_gemini_answer(prompt: str, is_json: bool = False) -> str:
         config = types.GenerateContentConfig(
             response_mime_type="application/json" if is_json else "text/plain"
         )
-
         response = gmn_client.models.generate_content(
             model="gemini-2.5-flash-lite",
             contents=prompt,
@@ -73,36 +78,39 @@ def generate_gemini_answer(prompt: str, is_json: bool = False) -> str:
 # =========================
 script_prompt = """
 ### Goal
-สร้าง SQLite script ที่สั้นและถูกต้องที่สุด เพื่อตอบคำถามจากข้อมูลที่มี โดยส่งออกเป็น JSON เท่านั้น
+Generate the shortest and most accurate SQLite script to answer the question. Output JSON only.
 
 ### Context
-คุณคือ SQLite Master ที่ทำงานในระบบอัตโนมัติ (Strict JSON API) ห้ามตอบเป็นคำพูด ให้ตอบเฉพาะโค้ดที่ใช้งานได้จริง
+You are a SQLite Master operating in Strict JSON API mode.
+Do NOT respond with any natural language text — only return valid JSON containing the SQL script.
 
 ### Input
-- คำถามที่ผู้ใช้ต้องการคำตอบ: <Question> {question} </Question>
-- ชื่อ Table ที่ต้องใช้ดึงข้อมูล: <Table_Name> {table_name} </Table_Name>
-- คำอธิบายคอลัมน์: <Schema>
+- User question: <Question> {question} </Question>
+- Table name: <Table_Name> {table_name} </Table_Name>
+- Column descriptions: <Schema>
 {data_dict}
 </Schema>
 
 ### Process
-1. วิเคราะห์ Query จาก <Question> และ <Schema>
-2. หากมีคอลัมน์วันที่ ให้ใช้ฟังก์ชัน `date()` หรือ `strftime()` ของ SQLite จัดการเสมอ
-3. เขียน SQL ให้กระชับและมุ่งเน้นเฉพาะคำตอบที่ต้องการ
+1. Analyze the question against the schema
+2. If date columns are involved, always use SQLite `date()` or `strftime()` functions
+3. Write concise SQL focused only on answering the question
 
 ### Output
-ตอบกลับเป็น JSON object รูปแบบเดียวเท่านั้น:
+Return ONLY this JSON format, nothing else:
 {{"script": "SELECT ... FROM ..."}}
 
-(ห้ามมีคำอธิบายประกอบ หรือ Markdown นอกเหนือจาก JSON)
+(No explanation, no Markdown, no text outside JSON)
 """
 
-answer_prompt = """
+answer_prompt_thai = """
 ### Goal
 สรุปผลลัพธ์จากข้อมูลและตอบคำถามอย่างถูกต้อง แม่นยำ และเป็นธรรมชาติ
 
 ### Context
-คุณคือ Data Analyst ที่ทำหน้าที่สรุปผลจาก DataFrame และตอบคำถามผู้ใช้แบบเจาะจง ห้ามตอบยาวเกินความจำเป็น และเน้นการวิเคราะห์เชิงตัวเลขที่ถูกต้อง
+คุณคือ Data Analyst ที่ทำหน้าที่สรุปผลจาก DataFrame และตอบคำถามผู้ใช้แบบเจาะจง
+ห้ามตอบยาวเกินความจำเป็น และเน้นการวิเคราะห์เชิงตัวเลขที่ถูกต้อง
+**ต้องตอบเป็นภาษาไทยเท่านั้น**
 
 ### Input
 - คำถามที่ผู้ใช้ต้องการคำตอบ: <Question> {question} </Question>
@@ -117,15 +125,44 @@ answer_prompt = """
 4. ระบุหน่วย (เช่น บาท, คน, ครั้ง, %) ต่อท้ายตัวเลขทุกครั้งตามบริบทของข้อมูล
 
 ### Output
-ตอบเป็นข้อความสั้น ๆ โดยมีโครงสร้างดังนี้:
+ตอบเป็นภาษาไทย ในรูปแบบข้อความสั้น ๆ:
 1. คำเกริ่นนำ: ใช้ประโยคสั้น ๆ เข้าประเด็นทันที
 2. เนื้อหา: ระบุผลการวิเคราะห์พร้อมตัวเลขที่ใส่คอมม่าและมีหน่วยลงท้ายเสมอ
+"""
+
+answer_prompt_english = """
+### Goal
+Summarize the query result and answer the question accurately, concisely, and naturally.
+
+### Context
+You are a Data Analyst summarizing DataFrame results for the user.
+Be concise, focused, and numerically precise.
+**You MUST respond in English only.**
+
+### Input
+- User question: <Question> {question} </Question>
+- Data from DataFrame: <Raw_Data>
+{raw_data}
+</Raw_Data>
+
+### Process
+1. Analyze <Raw_Data> in relation to <Question>
+2. Calculate and summarize key statistics
+3. Format numbers: use comma (,) as thousands separator, max 2 decimal places
+4. Always append appropriate units (e.g. THB, units, times, %) based on context
+
+### Output
+Respond in English with a short structured answer:
+1. Opening: one short sentence going straight to the point
+2. Content: analysis result with properly formatted numbers and units
 """
 
 # =========================
 # CORE LOGIC
 # =========================
 def generate_summary_answer(user_question: str) -> str:
+    lang = detect_language(user_question)
+
     # 1) Generate SQL from user question
     script_prompt_input = script_prompt.format(
         question=user_question,
@@ -141,7 +178,10 @@ def generate_summary_answer(user_question: str) -> str:
     try:
         sql_script = json.loads(sql_json_text)["script"]
     except Exception:
-        return f"ขออภัย ไม่สามารถสร้างคำสั่ง SQL ได้\n\nผลลัพธ์ที่ได้:\n{sql_json_text}"
+        if lang == "thai":
+            return f"ขออภัย ไม่สามารถสร้างคำสั่ง SQL ได้\n\nผลลัพธ์ที่ได้:\n{sql_json_text}"
+        else:
+            return f"Sorry, could not generate a SQL query.\n\nRaw output:\n{sql_json_text}"
 
     # 2) Query database
     df_result = query_to_dataframe(sql_script, db_name)
@@ -150,13 +190,22 @@ def generate_summary_answer(user_question: str) -> str:
         return df_result
 
     if df_result.empty:
-        return "ไม่พบข้อมูลที่ตรงกับคำถาม"
+        if lang == "thai":
+            return "ไม่พบข้อมูลที่ตรงกับคำถาม"
+        else:
+            return "No data found matching your question."
 
-    # 3) Generate natural language answer
-    answer_prompt_input = answer_prompt.format(
-        question=user_question,
-        raw_data=df_result.to_string(index=False)
-    )
+    # 3) Generate natural language answer in detected language
+    if lang == "thai":
+        answer_prompt_input = answer_prompt_thai.format(
+            question=user_question,
+            raw_data=df_result.to_string(index=False)
+        )
+    else:
+        answer_prompt_input = answer_prompt_english.format(
+            question=user_question,
+            raw_data=df_result.to_string(index=False)
+        )
 
     final_answer = generate_gemini_answer(answer_prompt_input, is_json=False)
 
@@ -184,7 +233,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-if prompt := st.chat_input("พิมพ์คำถามที่นี่..."):
+if prompt := st.chat_input("พิมพ์คำถามที่นี่... / Ask your question here..."):
     st.session_state.messages.append({
         "role": "user",
         "content": prompt
@@ -194,7 +243,7 @@ if prompt := st.chat_input("พิมพ์คำถามที่นี่..."
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("กำลังหาคำตอบ..."):
+        with st.spinner("กำลังหาคำตอบ... / Thinking..."):
             response = generate_summary_answer(prompt)
             st.markdown(response)
 
